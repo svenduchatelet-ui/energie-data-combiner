@@ -3,3 +3,4 @@ pandas
 openpyxl
 pulp
 plotly
+pvlib
