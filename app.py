@@ -50,33 +50,36 @@ def process_amr_file(file_upload) -> pd.DataFrame:
         st.error(f"Fout bij het verwerken van AMR-bestand '{file_upload.name}': {e}")
         return pd.DataFrame()
 
-# --- HERSTELDE FUNCTIE VOOR HET BELPEX-BESTAND ---
-def process_belpex_file(file_upload) -> pd.DataFrame:
-    """Leest het geüploade Belpex CSV-bestand met de robuuste, originele logica."""
-    if file_upload is None: return pd.DataFrame()
+# --- AANGEPAST: BELPEX WORDT NU ALS LOKAAL BESTAND GELEZEN ---
+def process_belpex_file() -> pd.DataFrame:
+    """Leest het Belpex CSV-bestand vanuit de repository."""
+    belpex_path = "BelpexFilter.csv" # Simpel pad naar het bestand
+    
     try:
-        df_belpex = pd.read_csv(file_upload, sep=';', encoding='cp1252') # decimal=',' verwijderd
+        df_belpex = pd.read_csv(belpex_path, sep=';', encoding='cp1252')
         df_belpex.columns = df_belpex.columns.str.strip()
         df_belpex['Tijdstip_uur'] = pd.to_datetime(df_belpex['Date'], dayfirst=True)
         
-        # Oorspronkelijke, robuuste methode om de prijs te filteren
         numeric_text = df_belpex['Euro'].str.extract(r'(-?[\d,]+)', expand=False)
         clean_price = pd.to_numeric(numeric_text.str.replace(',', '.'), errors='coerce')
         df_belpex['BELPEX_EUR_KWH'] = clean_price / 1000
         
         return df_belpex[['Tijdstip_uur', 'BELPEX_EUR_KWH']]
+    except FileNotFoundError:
+        st.error(f"Fout: Het bestand '{belpex_path}' niet gevonden in de repository. Zorg dat het bestand op GitHub staat.")
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Fout bij het verwerken van het Belpex-bestand: {e}")
+        st.error(f"Fout bij het laden van het Belpex-bestand: {e}")
         return pd.DataFrame()
 
 def to_excel(df: pd.DataFrame) -> bytes:
     """Converteert een DataFrame naar een Excel-bestand in het geheugen."""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+    with pd.ExcelWriter(output, engine='openxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
-# --- Streamlit App Interface ---
+# --- Streamlit App Interface (verder ongewijzigd) ---
 
 st.set_page_config(layout="wide", page_title="Energie Data Combiner")
 st.title("🔌 Energie Data Combiner")
@@ -85,7 +88,7 @@ st.markdown("Combineert Fluvius verbruiks-, injectie- en PV-data met Belpex-prij
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 
-st.header("Stap 1: Upload je bestanden")
+st.header("Stap 1: Upload je energiebestanden")
 
 with st.expander("Upload hier je bestanden", expanded=True):
     file_type = st.radio(
@@ -100,11 +103,10 @@ with st.expander("Upload hier je bestanden", expanded=True):
         file_injectie = st.file_uploader("2. Injectie (export) [.csv]", type="csv")
     with col2:
         file_pv = st.file_uploader("3. Hulpverbruik (PV-opbrengst) [.csv]", type="csv")
-        file_belpex = st.file_uploader("4. Belpex Prijzen (altijd .csv)", type="csv")
 
 if st.button("Verwerk bestanden", type="primary"):
-    if not (file_import or file_injectie or file_pv) or not file_belpex:
-        st.warning("Upload ten minste één energiebestand (import, injectie of PV) én het Belpex-bestand.")
+    if not (file_import or file_injectie or file_pv):
+        st.warning("Upload ten minste één energiebestand (import, injectie of PV) om door te gaan.")
     else:
         with st.spinner("Data wordt verwerkt..."):
             if file_type == 'Normale CSV (Fluvius)':
@@ -132,11 +134,15 @@ if st.button("Verwerk bestanden", type="primary"):
                 for df_to_merge in dataframes[1:]:
                     finale_df = pd.merge(finale_df, df_to_merge, on='Tijdstip', how='outer')
 
-                df_belpex = process_belpex_file(file_belpex)
+                df_belpex = process_belpex_file()
+                
                 if df_belpex is not None and not df_belpex.empty:
+                    st.success("Belpex-data succesvol geladen uit repository.")
                     finale_df['Tijdstip_uur'] = finale_df['Tijdstip'].dt.floor('H')
                     finale_df = pd.merge(finale_df, df_belpex, on='Tijdstip_uur', how='left')
                     finale_df.drop(columns=['Tijdstip_uur'], inplace=True)
+                else:
+                    st.error("Kon Belpex-data niet laden. De BELPEX-kolom zal leeg zijn.")
 
                 finale_df.rename(columns={'Tijdstip': 'Date', 'BELPEX_EUR_KWH': 'BELPEX'}, inplace=True)
                 
