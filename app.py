@@ -50,10 +50,9 @@ def process_amr_file(file_upload) -> pd.DataFrame:
         st.error(f"Fout bij het verwerken van AMR-bestand '{file_upload.name}': {e}")
         return pd.DataFrame()
 
-# --- AANGEPAST: BELPEX WORDT NU ALS LOKAAL BESTAND GELEZEN ---
 def process_belpex_file() -> pd.DataFrame:
     """Leest het Belpex CSV-bestand vanuit de repository."""
-    belpex_path = "BelpexFilter.csv" # Simpel pad naar het bestand
+    belpex_path = "BelpexFilter.csv"
     
     try:
         df_belpex = pd.read_csv(belpex_path, sep=';', encoding='cp1252')
@@ -66,7 +65,7 @@ def process_belpex_file() -> pd.DataFrame:
         
         return df_belpex[['Tijdstip_uur', 'BELPEX_EUR_KWH']]
     except FileNotFoundError:
-        st.error(f"Fout: Het bestand '{belpex_path}' niet gevonden in de repository. Zorg dat het bestand op GitHub staat.")
+        st.error(f"Fout: Het bestand '{belpex_path}' niet gevonden. Zorg dat het bestand lokaal of op GitHub in dezelfde map staat.")
         return pd.DataFrame()
     except Exception as e:
         st.error(f"Fout bij het laden van het Belpex-bestand: {e}")
@@ -75,7 +74,8 @@ def process_belpex_file() -> pd.DataFrame:
 def to_excel(df: pd.DataFrame) -> bytes:
     """Converteert een DataFrame naar een Excel-bestand in het geheugen."""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openxl') as writer:
+    # --- HIER ZAT DE TYPEFOUT ---
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
@@ -137,7 +137,7 @@ if st.button("Verwerk bestanden", type="primary"):
                 df_belpex = process_belpex_file()
                 
                 if df_belpex is not None and not df_belpex.empty:
-                    st.success("Belpex-data succesvol geladen uit repository.")
+                    st.success("Belpex-data succesvol geladen.")
                     finale_df['Tijdstip_uur'] = finale_df['Tijdstip'].dt.floor('H')
                     finale_df = pd.merge(finale_df, df_belpex, on='Tijdstip_uur', how='left')
                     finale_df.drop(columns=['Tijdstip_uur'], inplace=True)
