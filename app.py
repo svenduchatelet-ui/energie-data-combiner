@@ -9,7 +9,7 @@ import pvlib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- Functies voor dataverwerking (ongewijzigd) ---
+# --- Functies voor dataverwerking ---
 
 def process_energy_file(file_upload, register_type: str) -> pd.DataFrame:
     if file_upload is None: return pd.DataFrame()
@@ -70,34 +70,23 @@ def process_belpex_file() -> pd.DataFrame:
         st.error(f"Fout bij het laden van het Belpex-bestand: {e}")
         return pd.DataFrame()
 
-# --- VERNIEUWDE FUNCTIE (HYBRIDE AANPAK) ---
 @st.cache_data
 def process_pvgis_hybrid(segments, lat, lon, loss):
-    """Haalt TMY-weerdata op via de API en berekent de PV-productie lokaal met pvlib."""
     if not segments:
         return pd.DataFrame()
 
     with st.spinner(f"TMY-weerdata voor locatie ({lat}, {lon}) ophalen..."):
         try:
-            # Stap 1: Haal TMY weerdata op via de API
             tmy_api_url = f"https://re.jrc.ec.europa.eu/api/tmy?lat={lat}&lon={lon}&outputformat=csv"
-            
-            # Gebruik een robuuste sessie met retries
             session = requests.Session()
             retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             adapter = HTTPAdapter(max_retries=retry)
             session.mount('https://', adapter)
-            
             response = session.get(tmy_api_url, timeout=30)
             response.raise_for_status()
-
-            # Converteer de tekst-respons naar een virtueel bestand voor pvlib
             tmy_buffer = io.StringIO(response.text)
-            
-            # Lees de TMY data met pvlib
             weather, _, _, _ = pvlib.iotools.read_pvgis_tmy(tmy_buffer, map_variables=True)
             st.info("Weerdata succesvol opgehaald.")
-
         except requests.exceptions.RequestException as e:
             st.error(f"Kon geen weerdata ophalen bij PVGIS na 3 pogingen: {e}")
             return pd.DataFrame()
@@ -105,11 +94,9 @@ def process_pvgis_hybrid(segments, lat, lon, loss):
             st.error(f"Fout bij verwerken van TMY-weerdata: {e}")
             return pd.DataFrame()
 
-    # Stap 2: Bereken de PV-productie lokaal met de opgehaalde weerdata
     with st.spinner(f"Lokale PV-simulatie uitvoeren..."):
         location = pvlib.location.Location(latitude=lat, longitude=lon, tz='Europe/Brussels')
         total_ac_power = pd.Series(0.0, index=weather.index)
-
         for i, segment in enumerate(segments):
             system = pvlib.pvsystem.PVSystem(
                 surface_tilt=segment['slope'], surface_azimuth=segment['azimuth'],
@@ -126,14 +113,70 @@ def process_pvgis_hybrid(segments, lat, lon, loss):
     df_resampled = df_resampled.resample('15min').ffill() / 4
     df_resampled.reset_index(inplace=True)
     df_resampled.rename(columns={'index': 'Tijdstip'}, inplace=True)
-    
     return df_resampled
 
 def to_excel(df: pd.DataFrame) -> bytes:
-    """Converteert een DataFrame naar een Excel-bestand in het geheugen."""
+    """Converteert een DataFrame naar een standaard Excel-bestand."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
+    return output.getvalue()
+
+# --- AANGEPASTE FUNCTIE VOOR HET NIEUWE FORMAAT ---
+def to_multi_sheet_excel(df: pd.DataFrame) -> bytes:
+    """Converteert de data naar een Excel-bestand met aparte sheets in het nieuwe, specifieke formaat."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        
+        # Helper-functie om de transformatie naar het nieuwe formaat uit te voeren
+        def transform_for_new_format(data_df, kwh_column_name, register_name):
+            if kwh_column_name not in data_df.columns or data_df[kwh_column_name].sum() == 0:
+                return None # Sla over als de kolom niet bestaat of leeg is
+            
+            sheet_df = data_df[['Date', kwh_column_name]].copy()
+            
+            # Creëer start- en eindtijd kolommen
+            sheet_df['Van (datum)'] = sheet_df['Date'].dt.strftime('%d/%m/%Y')
+            sheet_df['Van (tijdstip)'] = sheet_df['Date'].dt.strftime('%H:%M:%S')
+            
+            end_datetime = sheet_df['Date'] + pd.Timedelta(minutes=15)
+            sheet_df['Tot (datum)'] = end_datetime.dt.strftime('%d/%m/%Y')
+            sheet_df['Tot (tijdstip)'] = end_datetime.dt.strftime('%H:%M:%S')
+            
+            # Hernoem volume kolom en voeg statische kolommen toe
+            sheet_df.rename(columns={kwh_column_name: 'Volume'}, inplace=True)
+
+            # --- AANPASSING HIER: Converteer naar string met komma als decimaal ---
+            sheet_df['Volume'] = sheet_df['Volume'].apply(lambda x: str(x).replace('.', ','))
+
+            sheet_df['Eenheid'] = 'KWH'
+            sheet_df['Register'] = register_name
+            
+            # Selecteer en orden de uiteindelijke kolommen
+            final_columns = ['Van (datum)', 'Van (tijdstip)', 'Tot (datum)', 'Tot (tijdstip)', 'Volume', 'Eenheid', 'Register']
+            return sheet_df[final_columns]
+
+        # Maak de sheets
+        # 1. Verbruik
+        verbruik_sheet = transform_for_new_format(df, 'import_kwh', 'afname actief')
+        if verbruik_sheet is not None:
+            verbruik_sheet.to_excel(writer, index=False, sheet_name='Verbruik')
+
+        # 2. Injectie
+        injectie_sheet = transform_for_new_format(df, 'injection_kwh', 'injectie actief')
+        if injectie_sheet is not None:
+            injectie_sheet.to_excel(writer, index=False, sheet_name='Injectie')
+
+        # 3. PV (van geüpload bestand)
+        pv_sheet = transform_for_new_format(df, 'pv_kwh', 'Hulpverbruik Actief')
+        if pv_sheet is not None:
+            pv_sheet.to_excel(writer, index=False, sheet_name='PV_kwh')
+
+        # 4. PVGIS (van simulatie)
+        pvgis_sheet = transform_for_new_format(df, 'PVGIS_kwh', 'PVGIS')
+        if pvgis_sheet is not None:
+            pvgis_sheet.to_excel(writer, index=False, sheet_name='PVGIS_kwh')
+
     return output.getvalue()
 
 # --- Streamlit App Interface ---
@@ -158,7 +201,6 @@ with st.expander("Upload hier je energiebestanden", expanded=True):
 
 with st.expander("Optioneel: Voeg PV-productie simulatie toe (Hybride API + pvlib)"):
     st.markdown("Definieer je locatie en voeg tot 5 PV-segmenten toe. De weerdata wordt live opgehaald, de berekening gebeurt lokaal.")
-    
     col_loc1, col_loc2, col_loc3 = st.columns(3)
     with col_loc1:
         lat = st.number_input("Breedtegraad", value=51.22, format="%.4f")
@@ -166,9 +208,6 @@ with st.expander("Optioneel: Voeg PV-productie simulatie toe (Hybride API + pvli
         lon = st.number_input("Lengtegraad", value=5.08, format="%.4f")
     with col_loc3:
         loss = st.number_input("Systeemverlies (%)", value=14, min_value=0, max_value=100, step=1)
-
-    # --- HIER IS DE AANPASSING ---
-    # De standaardwaarde (value) is nu 0 in plaats van 1.
     num_segments = st.number_input("Aantal PV-segmenten", min_value=0, max_value=5, value=0, step=1)
     
     pvgis_segments_hybrid = []
@@ -183,7 +222,6 @@ with st.expander("Optioneel: Voeg PV-productie simulatie toe (Hybride API + pvli
             with col5:
                 azimuth = st.number_input("Azimuth ° (0=Z, -90=O)", min_value=-180, max_value=180, value=0, key=f"pvgis_azimuth_{i}")
             pvgis_segments_hybrid.append({'kwp': kwp, 'slope': slope, 'azimuth': azimuth})
-
 
 if st.button("Verwerk bestanden en simuleer PV-productie", type="primary"):
     if not (file_import or file_injectie or file_pv):
@@ -227,14 +265,12 @@ if st.button("Verwerk bestanden en simuleer PV-productie", type="primary"):
                 st.session_state.processed_data = finale_df
                 st.success("✅ Energiebestanden succesvol verwerkt!")
 
-            # Voer de hybride PVGIS-simulatie uit
             if pvgis_segments_hybrid:
                 st.session_state.pvgis_data = process_pvgis_hybrid(pvgis_segments_hybrid, lat, lon, loss)
                 if st.session_state.pvgis_data is not None and not st.session_state.pvgis_data.empty:
                     st.success("✅ Hybride PV-simulatie succesvol uitgevoerd!")
             else:
                 st.session_state.pvgis_data = None
-
 
 if st.session_state.processed_data is not None:
     st.header("Stap 2: Selecteer datumbereik en download")
@@ -243,10 +279,8 @@ if st.session_state.processed_data is not None:
     
     if st.session_state.pvgis_data is not None and not st.session_state.pvgis_data.empty:
         pvgis_df = st.session_state.pvgis_data
-        
         pvgis_df['match_key'] = pvgis_df['Tijdstip'].dt.strftime('%m-%d %H:%M')
         df['match_key'] = df['Date'].dt.strftime('%m-%d %H:%M')
-        
         df = pd.merge(df, pvgis_df[['match_key', 'PVGIS_kwh']], on='match_key', how='left').drop(columns=['match_key'])
         df['PVGIS_kwh'].fillna(0, inplace=True)
 
@@ -267,10 +301,21 @@ if st.session_state.processed_data is not None:
         st.markdown(f"**Voorbeeld van de geselecteerde data ({len(filtered_df)} rijen):**")
         st.dataframe(filtered_df.head())
 
-        excel_data = to_excel(filtered_df)
+        excel_data_standaard = to_excel(filtered_df)
         st.download_button(
-            label="📥 Download geselecteerde data als Excel",
-            data=excel_data,
+            label="📥 Download als gecombineerd bestand",
+            data=excel_data_standaard,
             file_name=f"gefilterde_energiemix_{start_date}_tot_{end_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_standaard"
         )
+
+        excel_data_gesplitst = to_multi_sheet_excel(filtered_df)
+        st.download_button(
+            label="📥 Download in nieuw formaat (aparte sheets)",
+            data=excel_data_gesplitst,
+            file_name=f"gesplitste_energiemix_nieuw_formaat_{start_date}_tot_{end_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_gesplitst_nieuw"
+        )
+
