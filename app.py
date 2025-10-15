@@ -93,7 +93,7 @@ st.header("Stap 1: Upload je energiebestanden")
 with st.expander("Upload hier je bestanden", expanded=True):
     file_type = st.radio(
         "**Kies het type energiebestand:**",
-        ('Normale CSV (Fluvius)', 'AMR Bestand (Fluvius)'),
+        ('Normale CSV (Fluvius)', 'AMR Bestand'),
         horizontal=True
     )
     
