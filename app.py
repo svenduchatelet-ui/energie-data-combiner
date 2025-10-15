@@ -3,13 +3,15 @@ import pandas as pd
 from io import BytesIO
 import numpy as np
 import re
-import requests # Nodig voor de verbeterde API-aanroep
-import io # Nodig om tekst als een bestand te behandelen
+import requests
+import io
+import pvlib
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# --- Functies voor dataverwerking ---
+# --- Functies voor dataverwerking (ongewijzigd) ---
 
 def process_energy_file(file_upload, register_type: str) -> pd.DataFrame:
-    """Leest een geüpload normaal energie-CSV-bestand (type 1)."""
     if file_upload is None: return pd.DataFrame()
     try:
         df = pd.read_csv(file_upload, sep=';', decimal=',')
@@ -24,7 +26,6 @@ def process_energy_file(file_upload, register_type: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def process_amr_file(file_upload) -> pd.DataFrame:
-    """Verwerkt het specifieke AMR-formaat (skip 4 rows, filter on KWT, expand 96 values)."""
     if file_upload is None: return pd.DataFrame()
     try:
         df = pd.read_csv(file_upload, sep=';', skiprows=4, header=None)
@@ -53,7 +54,6 @@ def process_amr_file(file_upload) -> pd.DataFrame:
         return pd.DataFrame()
 
 def process_belpex_file() -> pd.DataFrame:
-    """Leest het Belpex CSV-bestand vanuit de repository."""
     belpex_path = "BelpexFilter.csv"
     try:
         df_belpex = pd.read_csv(belpex_path, sep=';', encoding='cp1252')
@@ -70,76 +70,63 @@ def process_belpex_file() -> pd.DataFrame:
         st.error(f"Fout bij het laden van het Belpex-bestand: {e}")
         return pd.DataFrame()
 
-# --- VERNIEUWDE FUNCTIE OM PVGIS DATA LIVE OP TE HALEN ---
+# --- VERNIEUWDE FUNCTIE (HYBRIDE AANPAK) ---
 @st.cache_data
-def process_pvgis_live(segments, lat, lon, year, loss):
-    """Haalt voor een lijst van segmenten de data live op bij PVGIS en telt de kWh-waarden op."""
+def process_pvgis_hybrid(segments, lat, lon, loss):
+    """Haalt TMY-weerdata op via de API en berekent de PV-productie lokaal met pvlib."""
     if not segments:
         return pd.DataFrame()
 
-    all_power_series = []
-    api_url = 'https://re.jrc.ec.europa.eu/api/seriescalc'
+    with st.spinner(f"TMY-weerdata voor locatie ({lat}, {lon}) ophalen..."):
+        try:
+            # Stap 1: Haal TMY weerdata op via de API
+            tmy_api_url = f"https://re.jrc.ec.europa.eu/api/tmy?lat={lat}&lon={lon}&outputformat=csv"
+            
+            # Gebruik een robuuste sessie met retries
+            session = requests.Session()
+            retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount('https://', adapter)
+            
+            response = session.get(tmy_api_url, timeout=30)
+            response.raise_for_status()
 
-    with st.spinner(f"PVGIS data voor {year} ophalen voor {len(segments)} segment(en)..."):
+            # Converteer de tekst-respons naar een virtueel bestand voor pvlib
+            tmy_buffer = io.StringIO(response.text)
+            
+            # Lees de TMY data met pvlib
+            weather, _, _, _ = pvlib.iotools.read_pvgis_tmy(tmy_buffer, map_variables=True)
+            st.info("Weerdata succesvol opgehaald.")
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Kon geen weerdata ophalen bij PVGIS na 3 pogingen: {e}")
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Fout bij verwerken van TMY-weerdata: {e}")
+            return pd.DataFrame()
+
+    # Stap 2: Bereken de PV-productie lokaal met de opgehaalde weerdata
+    with st.spinner(f"Lokale PV-simulatie uitvoeren..."):
+        location = pvlib.location.Location(latitude=lat, longitude=lon, tz='Europe/Brussels')
+        total_ac_power = pd.Series(0.0, index=weather.index)
+
         for i, segment in enumerate(segments):
-            try:
-                params = {
-                    'lat': lat, 'lon': lon, 'startyear': year, 'endyear': year,
-                    'outputformat': 'csv', 'pvcalculation': 1,
-                    'peakpower': segment['kwp'], 'loss': loss,
-                    'angle': segment['slope'], 'aspect': segment['azimuth'],
-                    'raddatabase': 'PVGIS-ERA5'
-                }
-                
-                response = requests.get(api_url, params=params)
-                response.raise_for_status() # Stopt als de HTTP-request mislukt
-
-                # Dynamische verwerking van de CSV-tekst
-                all_lines = response.text.strip().splitlines()
-                
-                header_index = -1
-                for j, line in enumerate(all_lines):
-                    if line.startswith('time,'):
-                        header_index = j
-                        break
-                
-                if header_index == -1:
-                    raise ValueError("Header-regel 'time,...' niet gevonden in de PVGIS-respons.")
-                
-                # Creëer een virtueel bestand in het geheugen voor pandas
-                csv_buffer = io.StringIO('\n'.join(all_lines[header_index:]))
-                
-                df_pvgis = pd.read_csv(csv_buffer)
-                
-                df_pvgis['time'] = pd.to_datetime(df_pvgis['time'], format='%Y%m%d:%H%M')
-                df_pvgis['P'] = pd.to_numeric(df_pvgis['P'], errors='coerce')
-                
-                all_power_series.append(df_pvgis.set_index('time')['P'])
-                st.info(f"Segment {i+1} ({segment['kwp']} kWp) succesvol opgehaald.")
-
-            except requests.exceptions.RequestException as e:
-                st.error(f"Fout bij de verbinding met PVGIS voor segment {i+1}: {e}")
-                continue
-            except Exception as e:
-                st.error(f"Fout bij verwerken van PVGIS data voor segment {i+1}: {e}")
-                continue
+            system = pvlib.pvsystem.PVSystem(
+                surface_tilt=segment['slope'], surface_azimuth=segment['azimuth'],
+                module_parameters={'pdc0': segment['kwp'], 'gamma_pdc': -0.004},
+                inverter_parameters={'pdc0': segment['kwp']},
+                losses_parameters=dict(losses_percent=loss)
+            )
+            mc = pvlib.modelchain.ModelChain(system, location, aoi_model='physical', spectral_model='no_loss')
+            mc.run_model(weather)
+            total_ac_power += mc.results.ac.fillna(0)
     
-    if not all_power_series:
-        return pd.DataFrame()
-
-    # Combineer de series en tel ze op
-    total_power_w = pd.concat(all_power_series, axis=1).sum(axis=1)
-    
-    # Converteer van W naar kWh per uur
-    total_energy_kwh_hourly = total_power_w / 1000
-    
-    # Resample van uurwaarden naar kwartierwaarden
+    total_energy_kwh_hourly = total_ac_power / 1000
     df_resampled = pd.DataFrame(total_energy_kwh_hourly, columns=['PVGIS_kwh'])
-    df_resampled = df_resampled.resample('15min').ffill() / 4 # Verdeel de uur-energie over 4 kwartieren
-    
+    df_resampled = df_resampled.resample('15min').ffill() / 4
     df_resampled.reset_index(inplace=True)
-    df_resampled.rename(columns={'time': 'Tijdstip'}, inplace=True)
-
+    df_resampled.rename(columns={'index': 'Tijdstip'}, inplace=True)
+    
     return df_resampled
 
 def to_excel(df: pd.DataFrame) -> bytes:
@@ -155,18 +142,13 @@ st.set_page_config(layout="wide", page_title="Energie Data Combiner")
 st.title("🔌 Energie Data Combiner")
 st.markdown("Combineert Fluvius verbruiks-, injectie- en PV-data met Belpex-prijzen.")
 
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
-if 'pvgis_data' not in st.session_state:
-    st.session_state.pvgis_data = None
+if 'processed_data' not in st.session_state: st.session_state.processed_data = None
+if 'pvgis_data' not in st.session_state: st.session_state.pvgis_data = None
 
 st.header("Stap 1: Upload je bestanden")
 
 with st.expander("Upload hier je energiebestanden", expanded=True):
-    file_type = st.radio(
-        "**Kies het type energiebestand:**",
-        ('Normale CSV (Fluvius)', 'AMR Bestand (Fluvius)'), horizontal=True
-    )
+    file_type = st.radio("**Kies het type energiebestand:**", ('Normale CSV (Fluvius)', 'AMR Bestand (Fluvius)'), horizontal=True)
     col1, col2 = st.columns(2)
     with col1:
         file_import = st.file_uploader("1. Afname (import) [.csv]", type="csv")
@@ -174,22 +156,22 @@ with st.expander("Upload hier je energiebestanden", expanded=True):
     with col2:
         file_pv = st.file_uploader("3. Hulpverbruik (PV-opbrengst) [.csv]", type="csv")
 
-with st.expander("Optioneel: Voeg live PVGIS-productie toe"):
-    st.markdown("Definieer je locatie en voeg tot 5 PV-segmenten toe. De data wordt live van de PVGIS-server gehaald.")
+with st.expander("Optioneel: Voeg PV-productie simulatie toe (Hybride API + pvlib)"):
+    st.markdown("Definieer je locatie en voeg tot 5 PV-segmenten toe. De weerdata wordt live opgehaald, de berekening gebeurt lokaal.")
     
-    col_loc1, col_loc2, col_loc3, col_loc4 = st.columns(4)
+    col_loc1, col_loc2, col_loc3 = st.columns(3)
     with col_loc1:
         lat = st.number_input("Breedtegraad", value=51.22, format="%.4f")
     with col_loc2:
         lon = st.number_input("Lengtegraad", value=5.08, format="%.4f")
     with col_loc3:
-        year = st.number_input("Simulatiejaar", value=2020, min_value=2005, max_value=2020, step=1, help="PVGIS-ERA5 data is beschikbaar t/m 2020.")
-    with col_loc4:
         loss = st.number_input("Systeemverlies (%)", value=14, min_value=0, max_value=100, step=1)
 
-    num_segments = st.number_input("Aantal PVGIS-segmenten", min_value=0, max_value=5, value=1, step=1)
+    # --- HIER IS DE AANPASSING ---
+    # De standaardwaarde (value) is nu 0 in plaats van 1.
+    num_segments = st.number_input("Aantal PV-segmenten", min_value=0, max_value=5, value=0, step=1)
     
-    pvgis_segments_live = []
+    pvgis_segments_hybrid = []
     if num_segments > 0:
         for i in range(num_segments):
             st.markdown(f"--- \n **Segment {i+1}**")
@@ -200,16 +182,14 @@ with st.expander("Optioneel: Voeg live PVGIS-productie toe"):
                 slope = st.number_input("Helling °", min_value=0, max_value=90, value=35, key=f"pvgis_slope_{i}")
             with col5:
                 azimuth = st.number_input("Azimuth ° (0=Z, -90=O)", min_value=-180, max_value=180, value=0, key=f"pvgis_azimuth_{i}")
-            
-            pvgis_segments_live.append({'kwp': kwp, 'slope': slope, 'azimuth': azimuth})
+            pvgis_segments_hybrid.append({'kwp': kwp, 'slope': slope, 'azimuth': azimuth})
 
 
-if st.button("Verwerk bestanden en haal PVGIS data op", type="primary"):
+if st.button("Verwerk bestanden en simuleer PV-productie", type="primary"):
     if not (file_import or file_injectie or file_pv):
         st.warning("Upload ten minste één energiebestand om door te gaan.")
     else:
         with st.spinner("Data wordt verwerkt..."):
-            # Bestaande logica voor Fluvius/AMR
             if file_type == 'Normale CSV (Fluvius)':
                 df_import = process_energy_file(file_import, "Afname Actief")
                 df_injectie = process_energy_file(file_injectie, "Injectie Actief")
@@ -231,7 +211,6 @@ if st.button("Verwerk bestanden en haal PVGIS data op", type="primary"):
                 finale_df = dataframes[0]
                 for df_to_merge in dataframes[1:]:
                     finale_df = pd.merge(finale_df, df_to_merge, on='Tijdstip', how='outer')
-
                 df_belpex = process_belpex_file()
                 if df_belpex is not None and not df_belpex.empty:
                     st.success("Belpex-data succesvol geladen.")
@@ -240,7 +219,6 @@ if st.button("Verwerk bestanden en haal PVGIS data op", type="primary"):
                     finale_df.drop(columns=['Tijdstip_uur'], inplace=True)
                 else:
                     st.error("Kon Belpex-data niet laden. De BELPEX-kolom zal leeg zijn.")
-
                 finale_df.rename(columns={'Tijdstip': 'Date', 'BELPEX_EUR_KWH': 'BELPEX'}, inplace=True)
                 for col in ['import_kwh', 'injection_kwh', 'pv_kwh', 'BELPEX']:
                     if col not in finale_df.columns: finale_df[col] = 0
@@ -249,11 +227,11 @@ if st.button("Verwerk bestanden en haal PVGIS data op", type="primary"):
                 st.session_state.processed_data = finale_df
                 st.success("✅ Energiebestanden succesvol verwerkt!")
 
-            # Haal PVGIS-data live op en bewaar het apart
-            if pvgis_segments_live:
-                st.session_state.pvgis_data = process_pvgis_live(pvgis_segments_live, lat, lon, year, loss)
+            # Voer de hybride PVGIS-simulatie uit
+            if pvgis_segments_hybrid:
+                st.session_state.pvgis_data = process_pvgis_hybrid(pvgis_segments_hybrid, lat, lon, loss)
                 if st.session_state.pvgis_data is not None and not st.session_state.pvgis_data.empty:
-                    st.success("✅ PVGIS-data succesvol opgehaald en verwerkt!")
+                    st.success("✅ Hybride PV-simulatie succesvol uitgevoerd!")
             else:
                 st.session_state.pvgis_data = None
 
@@ -266,19 +244,10 @@ if st.session_state.processed_data is not None:
     if st.session_state.pvgis_data is not None and not st.session_state.pvgis_data.empty:
         pvgis_df = st.session_state.pvgis_data
         
-        # Omdat de PVGIS-data voor een specifiek jaar is (bv. 2020),
-        # en de energiemetingen voor een ander jaar kunnen zijn, moeten we de
-        # dag en maand matchen, ongeacht het jaar.
         pvgis_df['match_key'] = pvgis_df['Tijdstip'].dt.strftime('%m-%d %H:%M')
         df['match_key'] = df['Date'].dt.strftime('%m-%d %H:%M')
         
-        df = pd.merge(
-            df,
-            pvgis_df[['match_key', 'PVGIS_kwh']],
-            on='match_key',
-            how='left'
-        ).drop(columns=['match_key'])
-        
+        df = pd.merge(df, pvgis_df[['match_key', 'PVGIS_kwh']], on='match_key', how='left').drop(columns=['match_key'])
         df['PVGIS_kwh'].fillna(0, inplace=True)
 
     min_date, max_date = df['Date'].min().date(), df['Date'].max().date()
